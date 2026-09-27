@@ -167,7 +167,12 @@ class BatchRequest(BaseModel):
 def _predict_one(features: BuildingFeatures) -> dict:
     row = pd.DataFrame([features.model_dump()])[FEATURE_COLS]
 
-    demand = float(_regressor.predict(row)[0])
+    # XGBoost regressors have no built-in floor -- given inputs outside
+    # what the model saw during training (e.g. the dashboard's dummy data
+    # generator, which isn't calibrated to match real BDG2 demand scale),
+    # it can extrapolate into negative "demand," which is physically
+    # meaningless. Clamp at 0.
+    demand = max(0.0, float(_regressor.predict(row)[0]))
 
     proba = _classifier.predict_proba(row)[0]
     tier_int = int(proba.argmax())

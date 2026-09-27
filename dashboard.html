@@ -113,6 +113,24 @@
   .block.High-Risk .roof, .block.High-Risk .facade { background: var(--high); }
   .block.Shed-Now .roof, .block.Shed-Now .facade { background: var(--shed); }
   .block.overridden .facade { outline: 2px dashed #fff; outline-offset: -2px; }
+  .block.protected .facade {
+    box-shadow: 0 0 12px rgba(79, 209, 165, 0.45);
+    border: 1px solid var(--accent);
+  }
+  .block.protected .roof {
+    border-color: var(--accent);
+  }
+  .shield-badge {
+    font-size: 8px;
+    font-family: var(--mono);
+    color: var(--accent);
+    background: #05130d;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 1px 3px;
+    margin-bottom: 2px;
+    letter-spacing: -0.2px;
+  }
   .block .label { font-size: 9px; color: var(--text-dim); margin-top: 4px; text-align: center;
                   max-width: 68px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .block .kwh { font-size: 9px; font-family: var(--mono); color: var(--text-dim); }
@@ -120,6 +138,37 @@
   .panel { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px; margin-bottom: 12px; }
   .panel h2 { font-size: 12px; text-transform: none; margin: 0 0 8px 0; color: var(--text-dim); font-weight: 600; }
   .plan-line { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 12px; padding: 2px 0; border-bottom: 1px solid #1c2521; }
+  .battery-bar-container {
+    width: 100%;
+    background: #090e0c;
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    height: 7px;
+    margin: 4px 0 6px 0;
+    overflow: hidden;
+  }
+  .battery-bar-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.3s ease;
+  }
+  .directive-box {
+    background: #0f1613;
+    border-left: 3px solid var(--accent);
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    border-radius: 0 4px 4px 0;
+    font-size: 11px;
+    font-family: var(--mono);
+  }
+  .directive-title {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .directive-desc {
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
   .log { max-height: 160px; overflow-y: auto; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
   .log div { padding: 2px 0; }
   textarea { width: 100%; height: 60px; resize: vertical; }
@@ -154,10 +203,13 @@
     <div class="panel">
       <h2>Endpoints</h2>
       <div style="display:flex; flex-direction:column; gap:6px;">
-        <input type="text" id="modelUrl" value="http://localhost:8001">
-        <input type="text" id="gridwiseUrl" value="http://localhost:8000">
+        <input type="text" id="modelUrl" value="http://localhost:8001" placeholder="Model Server URL">
+        <input type="text" id="gridwiseUrl" value="http://localhost:8002/gridwise" placeholder="GridWise URL">
       </div>
-      <div style="margin-top:8px; font-size:11px; color:var(--text-dim);" id="connStatus">checking connections…</div>
+      <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-size:11px; color:var(--text-dim);" id="connStatus">checking connections…</span>
+        <button id="reoptimizeBtn" style="font-size:11px; padding:3px 8px;">⚡ Re-optimize</button>
+      </div>
     </div>
 
     <div class="panel" id="detailPanel" style="display:none;">
@@ -165,6 +217,7 @@
       <h2 id="detailName">Building</h2>
       <div class="plan-line"><span>Predicted demand</span><span id="detailDemand">—</span></div>
       <div class="plan-line"><span>Risk tier</span><span id="detailTier">—</span></div>
+      <div class="plan-line"><span>Microgrid relief</span><span id="detailStatus">—</span></div>
       <label style="font-size:11px; color:var(--text-dim); display:block; margin-top:8px;">Operator override</label>
       <select id="detailOverride">
         <option value="">No override (use model)</option>
@@ -176,18 +229,23 @@
     </div>
 
     <div class="panel">
-      <h2>GridWise plan (this hour)</h2>
+      <h2>GridWise dispatch (this hour)</h2>
       <div id="planBody">
-        <div class="plan-line"><span>Grid</span><span>—</span></div>
+        <div class="plan-line"><span>Grid draw</span><span>—</span></div>
         <div class="plan-line"><span>Solar used</span><span>—</span></div>
         <div class="plan-line"><span>Battery</span><span>—</span></div>
       </div>
     </div>
 
     <div class="panel">
+      <h2>AI Directives (Gemini LLM)</h2>
+      <div id="directivesBody" style="font-size:11px; color:var(--text-dim);">No active directives.</div>
+    </div>
+
+    <div class="panel">
       <h2>Operator notes → GridWise</h2>
       <textarea id="operatorNote" placeholder="e.g. Don't charge battery between 2-4 PM"></textarea>
-      <button class="primary" id="sendNoteBtn" style="margin-top:6px; width:100%;">Send to GridWise</button>
+      <button class="primary" id="sendNoteBtn" style="margin-top:6px; width:100%;">Send to GridWise & Re-optimize</button>
     </div>
 
     <div class="panel">
@@ -300,7 +358,14 @@ function buildFeatures(b, now) {
 }
 
 // ---------------------------------------------------------------------------
-// FALLBACK HEURISTIC — used if the model server is unreachable
+// FALLBACK HEURISTIC — used if the model server is unreachable OR when
+// the ML model returns out-of-distribution predictions (0 / negative).
+// NOTE: The XGBoost regressor was trained on real BDG2 buildings that
+// had electricity readings in the ~100–5000 kWh range. Our simulation
+// uses 40–160 kWh baselines. The model extrapolates into negative values
+// (e.g. -34.4 kWh) which model_server.py clamps to 0. We detect this
+// per-building and fall back to the heuristic which uses actual simulated
+// values from simulateHourFor().
 // ---------------------------------------------------------------------------
 function heuristicPredict(b) {
   const last = b.history[b.history.length - 1];
@@ -328,7 +393,20 @@ async function callModelServer(now) {
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    setConnStatus(true, "model server");
+
+    // Per-building sanity check: XGBoost model can extrapolate to negative
+    // demand for simulation-scale inputs (clamped to 0 by model_server.py).
+    // Replace any zero/missing/errored prediction with the heuristic value.
+    let modelUsed = 0;
+    for (const b of buildings) {
+      const pred = data[b.id];
+      if (!pred || pred.error || typeof pred.predicted_demand_kwh !== "number" || pred.predicted_demand_kwh <= 0) {
+        data[b.id] = heuristicPredict(b);
+      } else {
+        modelUsed++;
+      }
+    }
+    setConnStatus(modelUsed > 0, "model server");
     return data;
   } catch (e) {
     setConnStatus(false, "model server");
@@ -338,55 +416,103 @@ async function callModelServer(now) {
   }
 }
 
-async function callGridWise(now, campusDemand, solarKwh) {
+let activePlan = null;
+let planDay = -1;
+let lastLoggedSummary = "";
+
+async function callGridWise(now, campusDemand, solarKwh, forceRefresh = false) {
   const url = document.getElementById("gridwiseUrl").value.replace(/\/$/, "");
+
+  // If a valid 24h plan is already cached for today, reuse it unless notes are pending or refresh is forced
+  if (activePlan && activePlan.hourly_plan && activePlan.hourly_plan.length === 24 && planDay === simDay && pendingNotes.length === 0 && !forceRefresh) {
+    return activePlan;
+  }
+
   const hours = [];
   for (let hr = 0; hr < 24; hr++) {
+    const d = campusDemand * (0.6 + 0.4 * Math.sin((hr - 6) / 24 * 2 * Math.PI));
+    const s = (hr >= 6 && hr <= 18) ? Math.max(0, solarKwh * Math.sin((hr - 6) / 12 * Math.PI)) : 0;
     hours.push({
       hour: hr,
-      demand_kwh: campusDemand * (0.6 + 0.4 * Math.sin((hr - 6) / 24 * 2 * Math.PI)),
-      solar_kwh: hr >= 6 && hr <= 18 ? solarKwh * Math.sin((hr - 6) / 12 * Math.PI) : 0,
+      demand_kwh: Math.max(0, Number(d.toFixed(2))),
+      solar_kwh: Math.max(0, Number(s.toFixed(2))),
       tariff_bdt_per_kwh: (hr >= 17 && hr <= 22) ? 12.0 : 7.0,
     });
   }
+
+  const notesToSend = pendingNotes.length ? pendingNotes.slice(0, 3) : ["No operator notes"];
+  const initialEnergy = (activePlan && activePlan.hourly_plan && activePlan.hourly_plan[simHour])
+    ? (activePlan.hourly_plan[simHour].battery_energy_after_kwh ?? 250)
+    : 250;
+
   const body = {
     scenario_id: `day${simDay}-hour${simHour}`,
-    operator_notes: pendingNotes.slice(0, 3),
+    operator_notes: notesToSend,
     hours,
-    battery: { capacity_kwh: 500, initial_energy_kwh: 250, max_charge_rate_kw: 100, max_discharge_rate_kw: 100 },
+    battery: {
+      capacity_kwh: 500,
+      initial_energy_kwh: Math.max(50, Math.min(500, initialEnergy)),
+      minimum_energy_kwh: 50,
+      max_charge_kwh_per_hour: 100,
+      max_discharge_kwh_per_hour: 100,
+    },
   };
-  pendingNotes = [];
+
+  setConnStatus(true, "gridwise", "GridWise: solving 24h LP optimization…");
 
   try {
     const res = await fetch(`${url}/optimize-energy`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(`HTTP ${res.status}: ${errJson.detail || res.statusText}`);
+    }
     const data = await res.json();
     setConnStatus(true, "gridwise");
+    activePlan = data;
+    planDay = simDay;
+    pendingNotes = []; // Clear pending notes only after successful API call
+    log(`GridWise 24h plan: peak ${data.peak_grid_kwh.toFixed(1)} kWh, total cost ${data.total_cost_bdt.toFixed(0)} BDT`);
+    if (data.directive_interpretation && data.directive_interpretation.some(d => d.applies)) {
+      data.directive_interpretation.filter(d => d.applies).forEach(d => {
+        log(`[AI Directive Applied] ${d.directive_type}: ${d.explanation}`);
+      });
+    }
     return data;
   } catch (e) {
     setConnStatus(false, "gridwise");
-    // local fallback: no optimization, just report raw numbers
-    const plan = hours[simHour];
+    log(`GridWise connection notice: ${e.message}`);
+    if (activePlan) return activePlan;
+
+    // Baseline fallback plan for 24h
     return {
-      hourly_plan: [{ hour: simHour, grid_kwh: plan.demand_kwh - plan.solar_kwh, solar_used_kwh: plan.solar_kwh,
-                       battery_action: "idle", battery_kwh: 0 }],
-      total_cost_bdt: plan.demand_kwh * plan.tariff_bdt_per_kwh,
-      peak_grid_kwh: plan.demand_kwh,
-      plan_summary: "GridWise unreachable — showing raw demand, no optimization applied.",
+      scenario_id: `fallback-day${simDay}`,
+      directive_interpretation: [],
+      hourly_plan: hours.map(h => ({
+        hour: h.hour,
+        grid_kwh: Math.max(0, h.demand_kwh - h.solar_kwh),
+        solar_used_kwh: Math.min(h.demand_kwh, h.solar_kwh),
+        battery_action: "idle",
+        battery_kwh: 0,
+        battery_energy_after_kwh: 250,
+      })),
+      total_cost_bdt: hours.reduce((sum, h) => sum + Math.max(0, h.demand_kwh - h.solar_kwh) * h.tariff_bdt_per_kwh, 0),
+      peak_grid_kwh: Math.max(...hours.map(h => Math.max(0, h.demand_kwh - h.solar_kwh))),
+      plan_summary: "GridWise unreachable — baseline dispatch active.",
     };
   }
 }
 
-function setConnStatus(ok, which) {
+function setConnStatus(ok, which, customMsg = null) {
   const el = document.getElementById("connStatus");
   const key = which === "model server" ? "model" : "gridwise";
   el.dataset[key] = ok ? "ok" : "down";
   const modelOk = el.dataset.model === "ok";
   const gwOk = el.dataset.gridwise === "ok";
-  el.textContent = `model server: ${el.dataset.model || "…"}  |  gridwise: ${el.dataset.gridwise || "…"}`;
+  el.textContent = customMsg || `model: ${el.dataset.model || "…"} | gridwise: ${el.dataset.gridwise || "…"}`;
   el.style.color = (modelOk && gwOk) ? "var(--accent)" : "var(--text-dim)";
 }
 
@@ -401,17 +527,22 @@ function log(msg) {
   while (el.children.length > 50) el.removeChild(el.lastChild);
 }
 
-function renderGrid(predictions) {
+function renderGrid(predictions, hourPlan = null) {
   const grid = document.getElementById("buildingGrid");
   grid.innerHTML = "";
   let atRisk = 0;
+  let protectedCount = 0;
   let totalDemand = 0;
 
-  // building height reflects load relative to the whole campus right now,
-  // not a fixed value -- so the skyline visibly shifts as demand shifts
+  // Local microgrid power dispatched by GridWise this hour (Solar + Battery discharge)
+  const solarUsed = hourPlan ? (hourPlan.solar_used_kwh || 0) : 0;
+  const batteryDischarge = (hourPlan && hourPlan.battery_action === "discharge") ? (hourPlan.battery_kwh || 0) : 0;
+  let remainingMicrogridPower = solarUsed + batteryDischarge;
+
   const allDemands = buildings.map(b => (predictions[b.id] || heuristicPredict(b)).predicted_demand_kwh);
   const maxDemand = Math.max(...allDemands, 1);
 
+  const buildingStates = [];
   for (const b of buildings) {
     const pred = predictions[b.id] || heuristicPredict(b);
     const forced = overrides[b.id];
@@ -420,12 +551,35 @@ function renderGrid(predictions) {
     b.lastRiskTier = tier;
     totalDemand += pred.predicted_demand_kwh;
     if (tier !== "Normal") atRisk++;
+    buildingStates.push({ b, pred, forced, tier });
+  }
+
+  // Allocate microgrid power to protect at-risk buildings from load-shedding
+  const tierPriority = { "Shed-Now": 3, "High-Risk": 2, "Watch": 1, "Normal": 0 };
+  const sortedAtRisk = buildingStates
+    .filter(s => s.tier !== "Normal")
+    .sort((a, b) => tierPriority[b.tier] - tierPriority[a.tier]);
+
+  const protectedSet = new Set();
+  for (const s of sortedAtRisk) {
+    const req = s.pred.predicted_demand_kwh * 0.4;
+    if (remainingMicrogridPower >= req && req > 0) {
+      remainingMicrogridPower -= req;
+      protectedSet.add(s.b.id);
+      protectedCount++;
+    }
+  }
+
+  for (const s of buildingStates) {
+    const { b, pred, forced, tier } = s;
+    const isProtected = protectedSet.has(b.id);
+    b.isProtected = isProtected;
 
     const heightPx = 24 + Math.round((pred.predicted_demand_kwh / maxDemand) * 110);
-
     const block = document.createElement("div");
-    block.className = `block ${tier}` + (forced ? " overridden" : "");
+    block.className = `block ${tier}` + (forced ? " overridden" : "") + (isProtected ? " protected" : "");
     block.innerHTML = `
+      ${isProtected ? '<div class="shield-badge">🛡️ GridWise</div>' : ''}
       <div class="roof"></div>
       <div class="facade" style="height:${heightPx}px"></div>
       <div class="label">${b.id.split("_").slice(1).join(" ")}</div>
@@ -436,22 +590,82 @@ function renderGrid(predictions) {
   }
 
   document.getElementById("statDemand").textContent = `${totalDemand.toFixed(0)} kWh`;
-  document.getElementById("statRisk").textContent = `${atRisk} / ${buildings.length}`;
+  document.getElementById("statRisk").textContent = protectedCount > 0
+    ? `${atRisk} (${protectedCount} saved)`
+    : `${atRisk} / ${buildings.length}`;
+
   return totalDemand;
 }
 
-function renderPlan(plan) {
+function renderPlan(plan, currentDemand) {
   const body = document.getElementById("planBody");
-  const hourPlan = (plan.hourly_plan || [])[0] || {};
+  const hourPlan = (plan.hourly_plan || []).find(h => h.hour === simHour)
+    || (plan.hourly_plan || [])[simHour]
+    || (plan.hourly_plan || [])[0]
+    || {};
+
+  const gridKwh = hourPlan.grid_kwh ?? currentDemand;
+  const solarUsed = hourPlan.solar_used_kwh ?? 0;
+  const batAction = hourPlan.battery_action || "idle";
+  const batKwh = hourPlan.battery_kwh ?? 0;
+  const batEnergy = hourPlan.battery_energy_after_kwh ?? 250;
+  const batPct = Math.min(100, Math.max(0, Math.round((batEnergy / 500) * 100)));
+
+  const tariff = (simHour >= 17 && simHour <= 22) ? 12.0 : 7.0;
+  const unoptimizedCost = currentDemand * tariff;
+  const optimizedCost = gridKwh * tariff;
+  const hourlySavings = Math.max(0, unoptimizedCost - optimizedCost);
+
+  let batText = "Idle";
+  let batColor = "var(--text-dim)";
+  if (batAction === "charge") {
+    batText = `Charging (+${batKwh.toFixed(1)} kWh)`;
+    batColor = "#60a5fa";
+  } else if (batAction === "discharge") {
+    batText = `Discharging (-${batKwh.toFixed(1)} kWh)`;
+    batColor = "var(--accent)";
+  }
+
   body.innerHTML = `
-    <div class="plan-line"><span>Grid</span><span>${(hourPlan.grid_kwh ?? 0).toFixed(1)} kWh</span></div>
-    <div class="plan-line"><span>Solar used</span><span>${(hourPlan.solar_used_kwh ?? 0).toFixed(1)} kWh</span></div>
-    <div class="plan-line"><span>Battery</span><span>${hourPlan.battery_action || "idle"}</span></div>
-    <div class="plan-line"><span>Peak (24h)</span><span>${(plan.peak_grid_kwh ?? 0).toFixed(1)} kWh</span></div>
+    <div class="plan-line"><span>Grid draw</span><span>${gridKwh.toFixed(1)} kWh</span></div>
+    <div class="plan-line"><span>Solar used</span><span style="color:var(--accent);">${solarUsed.toFixed(1)} kWh</span></div>
+    <div class="plan-line"><span>Battery action</span><span style="color:${batColor};">${batText}</span></div>
+    <div class="plan-line"><span>Battery SoC</span><span>${batEnergy.toFixed(0)} / 500 kWh (${batPct}%)</span></div>
+    <div class="battery-bar-container">
+      <div class="battery-bar-fill" style="width:${batPct}%;"></div>
+    </div>
+    <div class="plan-line"><span>Current tariff</span><span>${tariff.toFixed(1)} BDT/kWh ${tariff === 12 ? '<span style="color:#f59e0b;">(PEAK)</span>' : '(Off-Peak)'}</span></div>
+    <div class="plan-line"><span>Hourly savings</span><span style="color:var(--accent);">+${hourlySavings.toFixed(0)} BDT</span></div>
+    <div class="plan-line"><span>24h Peak grid</span><span>${(plan.peak_grid_kwh ?? 0).toFixed(1)} kWh</span></div>
+    <div class="plan-line"><span>24h Total cost</span><span>${(plan.total_cost_bdt ?? 0).toFixed(0)} BDT</span></div>
   `;
-  document.getElementById("statGrid").textContent = `${(hourPlan.grid_kwh ?? 0).toFixed(0)} kWh`;
-  document.getElementById("statCost").textContent = `${(plan.total_cost_bdt ?? 0).toFixed(0)} BDT`;
-  if (plan.plan_summary) log(plan.plan_summary);
+
+  document.getElementById("statGrid").textContent = `${gridKwh.toFixed(0)} kWh`;
+  document.getElementById("statCost").textContent = `${optimizedCost.toFixed(0)} BDT`;
+
+  // Render AI Directives
+  const dirBody = document.getElementById("directivesBody");
+  if (dirBody) {
+    const appliesList = (plan.directive_interpretation || []).filter(d => d.applies);
+    if (appliesList.length > 0) {
+      dirBody.innerHTML = appliesList.map(d => `
+        <div class="directive-box">
+          <div class="directive-title">⚡ ${d.directive_type.replace(/_/g, ' ').toUpperCase()}</div>
+          <div class="directive-desc">${d.explanation}</div>
+          ${d.structured_adjustment?.hours ? `<div style="font-size:10px; color:var(--accent); margin-top:2px;">Hours active: ${d.structured_adjustment.hours.join(', ')}</div>` : ''}
+        </div>
+      `).join("");
+    } else {
+      dirBody.innerHTML = `<div style="font-size:11px; color:var(--text-dim);">No active constraints (standard cost minimization).</div>`;
+    }
+  }
+
+  if (plan.plan_summary && plan.plan_summary !== lastLoggedSummary) {
+    log(`[GridWise] ${plan.plan_summary}`);
+    lastLoggedSummary = plan.plan_summary;
+  }
+
+  return hourPlan;
 }
 
 function openDetail(b) {
@@ -460,6 +674,9 @@ function openDetail(b) {
   document.getElementById("detailName").textContent = b.id.split("_").slice(1).join(" ");
   document.getElementById("detailDemand").textContent = `${(b.lastPrediction?.predicted_demand_kwh ?? 0).toFixed(1)} kWh`;
   document.getElementById("detailTier").textContent = b.lastRiskTier;
+  document.getElementById("detailStatus").textContent = b.isProtected ? "🛡️ Protected by GridWise microgrid" : (b.lastRiskTier === "Normal" ? "Stable" : "At Risk of Load-Shed");
+  document.getElementById("detailStatus").style.color = b.isProtected ? "var(--accent)" : (b.lastRiskTier === "Normal" ? "var(--text)" : "var(--shed)");
+
   const sel = document.getElementById("detailOverride");
   sel.value = overrides[b.id] || "";
   sel.onchange = () => {
@@ -474,30 +691,58 @@ document.getElementById("detailClose").onclick = () => {
 // ---------------------------------------------------------------------------
 // MAIN TICK LOOP — autonomous, runs on its own; operator can pause/override
 // ---------------------------------------------------------------------------
-async function tick() {
-  if (paused) return;
+let isTicking = false;
 
+async function tick() {
+  if (paused || isTicking) return;
+  isTicking = true;
+
+  try {
+    const now = {
+      hour: simHour, dayofweek: (simDay - 1) % 7, month: 7,
+      airTemperature: 26 + 6 * Math.sin((simHour - 8) / 24 * 2 * Math.PI) + Math.random() * 2,
+      dewTemperature: 20 + Math.random() * 3,
+      windSpeed: 1 + Math.random() * 4,
+    };
+
+    for (const b of buildings) simulateHourFor(b, simHour);
+
+    const predictions = await callModelServer(now);
+    const estDemand = buildings.reduce((sum, b) => sum + ((predictions[b.id] || heuristicPredict(b)).predicted_demand_kwh), 0);
+    const solarAvailable = (simHour >= 6 && simHour <= 18) ? estDemand * 0.3 : 0;
+
+    const plan = await callGridWise(now, estDemand, solarAvailable);
+    const hourPlan = renderPlan(plan, estDemand);
+    renderGrid(predictions, hourPlan);
+
+    document.getElementById("clock").textContent =
+      `Day ${simDay}, ${String(simHour).padStart(2, "0")}:00`;
+
+    simHour++;
+    if (simHour >= 24) {
+      simHour = 0;
+      simDay++;
+      activePlan = null; // Invalidate plan for new day
+    }
+  } catch (err) {
+    console.error("Tick error:", err);
+  } finally {
+    isTicking = false;
+  }
+}
+
+async function forceReoptimize() {
+  log("Re-optimizing 24h microgrid schedule with GridWise...");
   const now = {
     hour: simHour, dayofweek: (simDay - 1) % 7, month: 7,
-    airTemperature: 26 + 6 * Math.sin((simHour - 8) / 24 * 2 * Math.PI) + Math.random() * 2,
-    dewTemperature: 20 + Math.random() * 3,
-    windSpeed: 1 + Math.random() * 4,
+    airTemperature: 26 + 6 * Math.sin((simHour - 8) / 24 * 2 * Math.PI) + 1,
+    dewTemperature: 20, windSpeed: 2,
   };
-
-  for (const b of buildings) simulateHourFor(b, simHour);
-
-  const predictions = await callModelServer(now);
-  const totalDemand = renderGrid(predictions);
-
-  const solarAvailable = simHour >= 6 && simHour <= 18 ? totalDemand * 0.3 : 0;
-  const plan = await callGridWise(now, totalDemand, solarAvailable);
-  renderPlan(plan);
-
-  document.getElementById("clock").textContent =
-    `Day ${simDay}, ${String(simHour).padStart(2, "0")}:00`;
-
-  simHour++;
-  if (simHour >= 24) { simHour = 0; simDay++; }
+  const estDemand = buildings.reduce((sum, b) => sum + (b.lastPrediction?.predicted_demand_kwh || b.baseline), 0);
+  const solarAvailable = (simHour >= 6 && simHour <= 18) ? estDemand * 0.3 : 0;
+  const plan = await callGridWise(now, estDemand, solarAvailable, true);
+  const hourPlan = renderPlan(plan, estDemand);
+  renderGrid(Object.fromEntries(buildings.map(b => [b.id, b.lastPrediction || heuristicPredict(b)])), hourPlan);
 }
 
 document.getElementById("pauseBtn").onclick = (e) => {
@@ -513,18 +758,24 @@ document.getElementById("speedBtn").onclick = (e) => {
   loopHandle = setInterval(tick, TICK_MS / speedMultiplier);
 };
 
-document.getElementById("sendNoteBtn").onclick = () => {
+document.getElementById("sendNoteBtn").onclick = async () => {
   const ta = document.getElementById("operatorNote");
-  if (ta.value.trim()) {
-    pendingNotes.push(ta.value.trim());
-    log(`Operator note queued for GridWise: "${ta.value.trim()}"`);
+  const note = ta.value.trim();
+  if (note) {
+    pendingNotes.push(note);
+    log(`Operator note queued for GridWise: "${note}"`);
     ta.value = "";
+    await forceReoptimize();
   }
+};
+
+document.getElementById("reoptimizeBtn").onclick = async () => {
+  await forceReoptimize();
 };
 
 log("Dashboard started. Autonomous loop running — operator input optional.");
 let loopHandle = setInterval(tick, TICK_MS);
-tick(); // run first tick immediately instead of waiting for the first interval
+tick();
 </script>
 </body>
 </html>

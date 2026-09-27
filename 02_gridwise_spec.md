@@ -55,12 +55,23 @@ optimal hourly energy schedule that minimizes electricity cost.
 
 - `GET /health` → `{"status": "ok"}`
 - `POST /optimize-energy` → takes `scenario_id`, `operator_notes[]`,
-  `hours[]` (`hour`, `demand_kwh`, `solar_kwh`, `tariff_bdt_per_kwh`), and
-  `battery` (`capacity_kwh`, `initial_energy_kwh`, `max_charge_rate_kw`,
-  `max_discharge_rate_kw`) — returns `directive_interpretation[]`,
-  `hourly_plan[]` (`grid_kwh`, `solar_used_kwh`, `battery_action`,
-  `battery_kwh`, `battery_energy_after_kwh`), `total_grid_kwh`,
-  `total_cost_bdt`, `peak_grid_kwh`, `plan_summary`
+  `hours[]` (`hour`, `demand_kwh`, `solar_kwh`, `tariff_bdt_per_kwh` —
+  **must be exactly 24 entries, hours 0-23, or the request is rejected**),
+  and `battery` — returns `directive_interpretation[]`, `hourly_plan[]`
+  (`grid_kwh`, `solar_used_kwh`, `battery_action`, `battery_kwh`,
+  `battery_energy_after_kwh`), `total_grid_kwh`, `total_cost_bdt`,
+  `peak_grid_kwh`, `plan_summary`
+
+  **`battery` object — CONFIRMED AGAINST THE LIVE DEPLOYED API (Sept 2026),
+  not the original spec text below, which was wrong:**
+  `capacity_kwh`, `initial_energy_kwh`, `minimum_energy_kwh` (required,
+  not mentioned in the original spec at all), `max_charge_kwh_per_hour`
+  (NOT `max_charge_rate_kw` as originally documented),
+  `max_discharge_kwh_per_hour` (NOT `max_discharge_rate_kw`). If GridWise's
+  schema changes again, re-verify with a raw curl request rather than
+  trusting this doc or the original spec text blindly — this mismatch
+  is exactly how the dashboard would have silently failed every
+  GridWise call without anyone noticing until you tested it live.
 
 ## Files
 

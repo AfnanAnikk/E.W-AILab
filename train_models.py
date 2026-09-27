@@ -86,6 +86,7 @@ try:
 except ImportError:
     root_mean_squared_error = None
 from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.utils.class_weight import compute_sample_weight  # Issue 3: tier balancing
 
 
 # ===== CELL 1 ===== imports + config - edit DATA_DIR to your Google Drive folder
@@ -180,10 +181,13 @@ def engineer_features(df):
     # electricity lag features per building
     df["lag_1h"] = df.groupby("building_id")["electricity"].shift(1)
     df["lag_24h"] = df.groupby("building_id")["electricity"].shift(24)
+    # Rolling features must run WITHIN each building's groupby, otherwise
+    # the .shift(1).rolling(...) window bleeds across building boundaries
+    # (last row of building A folds into first rows of building B, corrupting
+    # the feature). transform() keeps the groupby intact across the chain.
     df["rolling_mean_24h"] = (
         df.groupby("building_id")["electricity"]
-        .shift(1).rolling(24, min_periods=6).mean()
-        .reset_index(level=0, drop=True)
+        .transform(lambda x: x.shift(1).rolling(24, min_periods=6).mean())
     )
 
     # HVAC meter lag + "is this meter stuck on" features -- high sustained
@@ -193,17 +197,32 @@ def engineer_features(df):
         df[f"{meter}_lag_1h"] = df.groupby("building_id")[meter].shift(1)
         df[f"{meter}_rolling_std_6h"] = (
             df.groupby("building_id")[meter]
-            .shift(1).rolling(6, min_periods=3).std()
-            .reset_index(level=0, drop=True)
+            .transform(lambda x: x.shift(1).rolling(6, min_periods=3).std())
         )
 
     # target: next hour's electricity demand
     df["target_next_hour"] = df.groupby("building_id")["electricity"].shift(-1)
 
-    # per-building risk thresholds computed on historical (non-leaking) demand
-    thresh = df.groupby("building_id")["electricity"].quantile(
-        [WATCH_PCTL, HIGH_RISK_PCTL, SHED_NOW_PCTL]
-    ).unstack()
+    # Risk thresholds MUST be computed before the train/test split -- if we
+    # use the full timeline (train+test hours mixed) the test-set buildings'
+    # own future demand values influence what counts as "High-Risk" or
+    # "Shed-Now", a leakage that overstates classifier accuracy.
+    # Reframe: compute a per-building chronological 80/50 split, derive
+    # thresholds only on the earlier (train-time-eligible) slice, then
+    # merge those thresholds back onto every row. Test rows still get a
+    # tier label (so we can score them), but the thresholds themselves
+    # reflect only data a real deployment would have had at train time.
+    df = df.sort_values(["building_id", "timestamp"]).reset_index(drop=True)
+    per_building_counts = df.groupby("building_id")["building_id"].transform("count")
+    train_eligible_mask = df.groupby("building_id").cumcount() < (
+        per_building_counts * 0.8
+    )
+    thresh_train_rows = df[train_eligible_mask.values]
+    thresh = (
+        thresh_train_rows.groupby("building_id")["electricity"]
+        .quantile([WATCH_PCTL, HIGH_RISK_PCTL, SHED_NOW_PCTL])
+        .unstack()
+    )
     thresh.columns = ["watch_thresh", "high_thresh", "shed_thresh"]
     df = df.merge(thresh, on="building_id", how="left")
 
@@ -253,7 +272,10 @@ def build_dataset():
     # weeks, which is an easier task than the real deployment scenario
     # (forecasting hours the model has never seen any neighbors of) and
     # would optimistically inflate the regressor's R2.
-    df = df.sort_values(["building_id", "timestamp"]).reset_index(drop=True)
+    # Note: the train_eligible_mask above and split_idx here use the SAME
+    # 80% cutoff on the SAME (building_id, timestamp)-sorted frame, so the
+    # rows used to derive risk thresholds are exactly the rows in the
+    # training set -- no threshold leakage.
     split_idx = df.groupby("building_id").cumcount() < (
         df.groupby("building_id")["building_id"].transform("count") * 0.8
     )
@@ -316,7 +338,13 @@ def train_classifier(data):
         subsample=0.8, colsample_bytree=0.8, random_state=RANDOM_STATE,
         eval_metric="mlogloss"
     )
-    clf.fit(data["X_train"], data["yclf_train"])
+    # Issue 3: tier distribution is heavily skewed (Normal ~75%, Shed-Now ~3%).
+    # Without class balancing the classifier defaults to predicting Normal for
+    # almost everything, which is why High-Risk / Shed-Now recall is so low.
+    # scale_pos_weight is binary-only, so for multiclass we hand XGBoost a
+    # per-sample weight that upweights minority tiers on every .fit() call.
+    sample_weights = compute_sample_weight("balanced", data["yclf_train"])
+    clf.fit(data["X_train"], data["yclf_train"], sample_weight=sample_weights)
     pred_c = clf.predict(data["X_test"])
 
     print(f"  Accuracy: {accuracy_score(data['yclf_test'], pred_c):.3f}")
